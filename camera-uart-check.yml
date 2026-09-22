@@ -1,0 +1,186 @@
+name: Camera UART check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Install compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi
+
+      - name: Write source and test
+        shell: bash
+        run: |
+          mkdir -p out
+          cat > out/camera-uart-check.c <<'SOURCE_EOF'
+          /* UART diagnostic only. Run with flight controller disconnected. */
+          #define _POSIX_C_SOURCE 200809L
+          #include <asm/termbits.h>
+          #include <asm/ioctls.h>
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <poll.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/ioctl.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          static uint64_t ms(void) {
+              struct timespec t;
+              if (clock_gettime(CLOCK_MONOTONIC, &t)) return 0;
+              return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+          }
+          static int transfer(int fd, const unsigned char *tx, unsigned char *rx, size_t len) {
+              size_t written = 0, received = 0;
+              uint64_t end = ms() + 2000;
+              while ((written < len || received < len) && ms() < end) {
+                  struct pollfd p = {fd, POLLIN | (written < len ? POLLOUT : 0), 0};
+                  int ready = poll(&p, 1, 20);
+                  if (ready < 0 && errno == EINTR) continue;
+                  if (ready < 0 || (p.revents & (POLLERR | POLLHUP | POLLNVAL))) return -1;
+                  if (p.revents & POLLOUT) {
+                      ssize_t n = write(fd, tx + written, len - written);
+                      if (n > 0) written += (size_t)n;
+                      else if (n < 0 && errno != EAGAIN && errno != EINTR) return -1;
+                  }
+                  if ((p.revents & POLLIN) && received < len) {
+                      ssize_t n = read(fd, rx + received, len - received);
+                      if (n > 0) received += (size_t)n;
+                      else if (n < 0 && errno != EAGAIN && errno != EINTR) return -1;
+                  }
+              }
+              if (written != len || received != len) {
+                  fprintf(stderr, "TIMEOUT: sent=%zu received=%zu expected=%zu\n", written, received, len);
+                  return -1;
+              }
+              return memcmp(tx, rx, len) ? -1 : 0;
+          }
+          int main(int argc, char **argv) {
+              if (argc != 3 || (strcmp(argv[1], "--check") && strcmp(argv[1], "--loopback"))) {
+                  fprintf(stderr, "Usage: %s --check DEVICE | --loopback DEVICE\nFlight controller must be disconnected. Loopback requires TX connected to RX.\n", argv[0]);
+                  return 1;
+              }
+              FILE *f = fopen("/proc/consoles", "r");
+              if (!f) { perror("/proc/consoles"); return 1; }
+              char line[256];
+              const char *name = strrchr(argv[2], '/'); name = name ? name + 1 : argv[2];
+              while (fgets(line, sizeof(line), f)) {
+                  char console[128];
+                  if (sscanf(line, "%127s", console) == 1 && !strcmp(console, name)) {
+                      fprintf(stderr, "Refusing active Linux console %s\n", name); fclose(f); return 1;
+                  }
+              }
+              fclose(f);
+              int fd = open(argv[2], O_RDWR | O_NOCTTY | O_NONBLOCK);
+              if (fd < 0) { perror("open UART"); return 1; }
+              if (ioctl(fd, TIOCEXCL)) { perror("TIOCEXCL"); close(fd); return 1; }
+              struct termios2 original, t, actual;
+              int result = 1;
+              if (ioctl(fd, TCGETS2, &original)) { perror("TCGETS2"); goto close_port; }
+              t = original;
+              t.c_iflag = 0; t.c_oflag = 0; t.c_lflag = 0;
+              t.c_cflag = BOTHER | CS8 | CLOCAL | CREAD;
+              t.c_ispeed = 420000; t.c_ospeed = 420000;
+              t.c_cc[VMIN] = 0; t.c_cc[VTIME] = 0;
+              if (ioctl(fd, TCSETS2, &t)) { perror("TCSETS2"); goto restore; }
+              if (ioctl(fd, TCGETS2, &actual)) { perror("TCGETS2 readback"); goto restore; }
+              printf("Driver reports RX=%u TX=%u baud, 8N1, flow control off\n",
+                     actual.c_ispeed, actual.c_ospeed);
+              if (actual.c_ispeed != 420000 || actual.c_ospeed != 420000 ||
+                  (actual.c_cflag & (CSIZE | PARENB | CSTOPB | CRTSCTS)) != CS8) {
+                  fprintf(stderr, "UART settings did not match request\n"); goto restore;
+              }
+              if (!strcmp(argv[1], "--check")) {
+                  puts("PASS: driver accepted 420000 baud. No bytes transmitted."); result = 0;
+                  goto restore;
+              }
+              if (ioctl(fd, TCFLSH, TCIOFLUSH)) { perror("TCFLSH"); goto restore; }
+              unsigned char tx[64], rx[64];
+              for (unsigned int round = 0; round < 100; ++round) {
+                  for (unsigned int i = 0; i < sizeof(tx); ++i)
+                      tx[i] = (unsigned char)(i * 37u + round * 13u);
+                  if (transfer(fd, tx, rx, sizeof(tx))) {
+                      fprintf(stderr, "FAIL: loopback round %u\n", round); goto restore;
+                  }
+              }
+              puts("PASS: loopback 6400/6400 bytes matched at requested 420000 baud.");
+              puts("Loopback does not measure absolute baud accuracy; FC interoperability is a separate test.");
+              result = 0;
+          restore:
+              if (ioctl(fd, TCSETS2, &original)) { perror("restore UART"); result = 1; }
+          close_port:
+              if (ioctl(fd, TIOCNXCL)) { perror("TIOCNXCL"); result = 1; }
+              close(fd);
+              return result;
+          }
+          SOURCE_EOF
+          cat > test.py <<'TEST_EOF'
+          import os, pty, subprocess, threading, select, time
+          def run(mode, echo):
+              master, slave = pty.openpty()
+              device = os.ttyname(slave)
+              stop = threading.Event()
+              def worker():
+                  while not stop.is_set():
+                      if select.select([master], [], [], 0.05)[0]:
+                          try:
+                              data = os.read(master, 4096)
+                              if echo and data:
+                                  offset = 0
+                                  while offset < len(data):
+                                      offset += os.write(master, data[offset:])
+                          except OSError:
+                              time.sleep(0.01)
+              t = threading.Thread(target=worker)
+              t.start()
+              try:
+                  p = subprocess.run(['./out/check-native', mode, device], capture_output=True, text=True, timeout=8)
+                  print(p.stdout, p.stderr)
+                  return p
+              finally:
+                  stop.set(); t.join(timeout=1)
+                  os.close(slave); os.close(master)
+          p = run('--check', False)
+          assert p.returncode == 0 and 'No bytes transmitted' in p.stdout
+          p = run('--loopback', True)
+          assert p.returncode == 0 and '6400/6400' in p.stdout
+          p = run('--loopback', False)
+          assert p.returncode != 0 and 'TIMEOUT' in p.stderr
+          print('PASS: settings readback, byte loopback, missing-loopback timeout')
+          TEST_EOF
+
+      - name: Test native executable using a pseudoterminal
+        run: |
+          set -eu
+          gcc -std=c11 -O2 -Wall -Wextra -Werror out/camera-uart-check.c -o out/check-native
+          python3 test.py
+
+      - name: Build static ARM executable
+        run: |
+          set -eu
+          arm-linux-gnueabi-gcc -std=c11 -Os -static -march=armv5te -mfloat-abi=soft -Wall -Wextra -Werror out/camera-uart-check.c -o out/camera-uart-check
+          arm-linux-gnueabi-strip out/camera-uart-check
+          arm-linux-gnueabi-readelf -h out/camera-uart-check > out/elf-header.txt
+          arm-linux-gnueabi-readelf -l out/camera-uart-check > out/elf-segments.txt
+          if grep -q INTERP out/elf-segments.txt; then exit 1; fi
+          rm out/check-native
+          cd out
+          sha256sum camera-uart-check camera-uart-check.c > SHA256SUMS
+          printf '%s\n' 'UART diagnostic only. Disconnect flight controller and USB-UART adapter.' 'Start with: ./camera-uart-check --check /dev/ttyAMA0' 'For loopback, connect camera TX to camera RX AFTER Linux has booted.' 'Then: ./camera-uart-check --loopback /dev/ttyAMA0' 'Remove the jumper after testing. UART settings are restored on normal completion.' 'Does not change firmware or bootloader. Does not measure absolute baud accuracy.' > READ-FIRST.txt
+
+      - name: Upload UART diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: camera-uart-check
+          path: out/
+          retention-days: 14
