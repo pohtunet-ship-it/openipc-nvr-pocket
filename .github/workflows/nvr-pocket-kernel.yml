@@ -1,0 +1,147 @@
+name: NVR Pocket USB kernel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nvr-pocket-kernel
+  cancel-in-progress: false
+
+jobs:
+  kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      FW_REV: 7ca8b7eb6af816c6469434b4f6945bb2fa970e17
+      BUILDER_REV: 01328cd601512e134decca1ff16962300ff162e4
+      LINUX_REV: 6b8ca794ec3e1e35ee260377443a6a729df27e91
+    steps:
+      - name: Checkout pinned OpenIPC firmware
+        uses: actions/checkout@v4
+        with:
+          repository: OpenIPC/firmware
+          ref: 7ca8b7eb6af816c6469434b4f6945bb2fa970e17
+          path: firmware
+          persist-credentials: false
+
+      - name: Checkout matching FPV build profile
+        uses: actions/checkout@v4
+        with:
+          repository: OpenIPC/builder
+          ref: 01328cd601512e134decca1ff16962300ff162e4
+          path: builder-source
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake autotools-dev bc bison build-essential ca-certificates \
+            cpio curl file flex git libelf-dev libncurses-dev libssl-dev \
+            libtool lzop patch pkg-config python3 rsync unzip wget xz-utils
+
+      - name: Prepare FPV profile and enable built-in USB input
+        run: |
+          mkdir -p artifacts
+          cp -a builder-source/devices/common/. firmware/
+          cp -a builder-source/package/. firmware/general/package/
+          python3 - <<'PY'
+          import os, pathlib, re
+          root = pathlib.Path('firmware')
+          packages = root / 'general/package/Config.in'
+          text = packages.read_text()
+          for entry in sorted(pathlib.Path('builder-source/package').iterdir()):
+              if (entry / 'Config.in').is_file():
+                  line = f'source "$BR2_EXTERNAL_GENERAL_PATH/package/{entry.name}/Config.in"'
+                  if line not in text:
+                      text += '\n' + line + '\n'
+          packages.write_text(text)
+          profile = root / 'br-ext-chip-hisilicon/configs/hi3536dv100_fpv_defconfig'
+          text = profile.read_text()
+          text, count = re.subn(
+              r'^BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION=.*$',
+              'BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION="https://github.com/OpenIPC/linux/archive/' + os.environ['LINUX_REV'] + '.tar.gz"',
+              text, flags=re.M)
+          assert count == 1, 'Kernel source setting not found'
+          profile.write_text(text)
+          config = root / 'br-ext-chip-hisilicon/board/hi3536dv100/hi3536dv100.generic.config'
+          text = config.read_text()
+          pathlib.Path('artifacts/kernel.config.before').write_text(text)
+          options = ['INPUT', 'INPUT_EVDEV', 'INPUT_JOYDEV', 'HID',
+                     'HID_GENERIC', 'USB_HID', 'HIDRAW', 'IKCONFIG', 'IKCONFIG_PROC']
+          for option in options:
+              key = 'CONFIG_' + option
+              text = re.sub(r'^(?:' + key + r'=.*|# ' + key + r' is not set)\n?', '', text, flags=re.M)
+              text += '\n' + key + '=y\n'
+          config.write_text(text)
+          pathlib.Path('artifacts/kernel.config.requested').write_text(text)
+          pathlib.Path('artifacts/source-revisions.txt').write_text(
+              '\n'.join(k + '=' + os.environ[k] for k in ['FW_REV', 'BUILDER_REV', 'LINUX_REV']) + '\n')
+          PY
+
+      - name: Build only the kernel
+        working-directory: firmware
+        shell: bash
+        run: |
+          set -o pipefail
+          make BOARD=hi3536dv100_fpv br-linux 2>&1 | tee ../artifacts/build.log
+
+      - name: Validate kernel and package test image
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, struct, zlib
+          out = pathlib.Path('artifacts')
+          candidates = [p for p in pathlib.Path('firmware/output/build').glob('linux-*/.config')]
+          assert len(candidates) == 1, f'Unexpected kernel configs: {candidates}'
+          config = candidates[0]
+          text = config.read_text()
+          shutil.copy2(config, out / 'kernel.config.built')
+          for option in ['INPUT', 'INPUT_EVDEV', 'INPUT_JOYDEV', 'HID', 'HID_GENERIC',
+                         'USB_HID', 'HIDRAW', 'IKCONFIG', 'IKCONFIG_PROC']:
+              assert f'CONFIG_{option}=y' in text.splitlines(), f'Missing built-in {option}'
+          release = (config.parent / 'include/config/kernel.release').read_text().strip()
+          assert release == '4.9.37', f'Kernel module release mismatch: {release}'
+          image = pathlib.Path('firmware/output/images/uImage')
+          data = image.read_bytes()
+          assert 64 < len(data) <= 0x200000, 'Kernel does not fit the existing 2 MiB partition'
+          header = struct.unpack('>7I4B32s', data[:64])
+          assert header[0] == 0x27051956, 'Not a legacy uImage'
+          assert header[3] == len(data) - 64, 'Payload length mismatch'
+          assert header[4] == header[5] == 0x80008000, 'Unexpected load/entry address'
+          assert header[7:10] == (5, 2, 2), 'Not an ARM Linux kernel'
+          check_header = bytearray(data[:64])
+          check_header[4:8] = bytes(4)
+          assert zlib.crc32(check_header) & 0xffffffff == header[1], 'Header CRC mismatch'
+          assert zlib.crc32(data[64:]) & 0xffffffff == header[6], 'Payload CRC mismatch'
+          target = out / 'uImage.hi3536dv100-pocket-test'
+          shutil.copy2(image, target)
+          digest = hashlib.sha256(data).hexdigest()
+          (out / 'SHA256SUMS').write_text(f'{digest}  {target.name}\n')
+          report = {'kernel_release': release, 'bytes': len(data), 'size_hex': hex(len(data)),
+                    'crc32': f'{zlib.crc32(data) & 0xffffffff:08x}', 'sha256': digest,
+                    'load_address': hex(header[4]), 'entry_point': hex(header[5]),
+                    'compression_id': header[10], 'partition_limit': 0x200000,
+                    'hardware_tested': False}
+          (out / 'validation.json').write_text(json.dumps(report, indent=2) + '\n')
+          (out / 'READ-FIRST.txt').write_text(
+              'TEST KERNEL ONLY. No bootloader or root filesystem is included.\n'
+              'Build checks do not prove compatibility with installed proprietary video modules.\n'
+              'First test by TFTP loading into RAM with the existing flash root filesystem.\n'
+              'Do not flash until boot, HDMI video, USB input and module loading are verified.\n'
+              'The existing MMZ script warning is a separate issue, not changed by this kernel.\n')
+          print(json.dumps(report, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## NVR Pocket test kernel\n\n```json\n' + json.dumps(report, indent=2) + '\n```\n')
+          PY
+
+      - name: Upload kernel and diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvr-pocket-kernel-${{ github.run_number }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
