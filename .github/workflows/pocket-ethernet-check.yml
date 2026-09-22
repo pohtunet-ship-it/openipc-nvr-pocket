@@ -1,0 +1,257 @@
+name: Pocket Ethernet diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Install ARM compiler and emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi qemu-user
+
+      - name: Write diagnostic source and tests
+        shell: bash
+        run: |
+          mkdir -p out
+          cat > out/pocket-link-check.c <<'SOURCE_EOF'
+          /* Diagnostic only: USB joystick -> UDP -> text. Never opens a UART. */
+          #define _POSIX_C_SOURCE 200809L
+          #include <arpa/inet.h>
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/joystick.h>
+          #include <poll.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/ioctl.h>
+          #include <sys/socket.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          #define PORT 5610
+          #define PACKET_SIZE 32
+          static uint64_t millis(void) {
+              struct timespec t;
+              if (clock_gettime(CLOCK_MONOTONIC, &t)) { perror("clock_gettime"); exit(1); }
+              return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+          }
+          static void fail(const char *s) { perror(s); exit(1); }
+          static void put32(unsigned char *p, uint32_t v) {
+              p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
+              p[2] = (unsigned char)(v >> 8); p[3] = (unsigned char)v;
+          }
+          static uint32_t get32(const unsigned char *p) {
+              return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+          }
+          static void encode(unsigned char *p, uint32_t session, uint32_t seq,
+                             const int16_t *axes, uint32_t buttons) {
+              memcpy(p, "PCK1", 4); put32(p + 4, session); put32(p + 8, seq);
+              for (int i = 0; i < 8; ++i) {
+                  uint16_t v = (uint16_t)axes[i];
+                  p[12 + i * 2] = (unsigned char)(v >> 8);
+                  p[13 + i * 2] = (unsigned char)v;
+              }
+              put32(p + 28, buttons);
+          }
+          static int decode(const unsigned char *p, size_t n, int16_t *axes) {
+              if (n != PACKET_SIZE || memcmp(p, "PCK1", 4)) return 0;
+              for (int i = 0; i < 8; ++i) {
+                  int v = ((int)p[12 + i * 2] << 8) | p[13 + i * 2];
+                  if (v >= 32768) v -= 65536;
+                  if (v < -32767) return 0;
+                  axes[i] = (int16_t)v;
+              }
+              return 1;
+          }
+          static int channel(int16_t v) {
+              return 1000 + (int)(((int64_t)v + 32767) * 1000 + 32767) / 65534;
+          }
+          static struct sockaddr_in address(const char *ip) {
+              struct sockaddr_in a;
+              memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons(PORT);
+              if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) {
+                  fprintf(stderr, "Invalid IPv4 address: %s\n", ip); exit(1);
+              }
+              return a;
+          }
+          static void transmit(const char *ip, const char *device) {
+              struct sockaddr_in dst = address(ip);
+              int fd = open(device, O_RDONLY | O_NONBLOCK);
+              if (fd < 0) fail(device);
+              unsigned char count = 0;
+              if (ioctl(fd, JSIOCGAXES, &count) < 0) fail("JSIOCGAXES");
+              if (count != 8) { fprintf(stderr, "Expected 8 Classic axes, got %u\n", count); exit(1); }
+              int s = socket(AF_INET, SOCK_DGRAM, 0);
+              if (s < 0) fail("socket");
+              int flags = fcntl(s, F_GETFL);
+              if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) fail("fcntl");
+              int16_t axes[8] = {0};
+              uint32_t buttons = 0, seq = 0, session = 0;
+              int random = open("/dev/urandom", O_RDONLY);
+              if (random < 0 || read(random, &session, sizeof(session)) != sizeof(session)) fail("random");
+              close(random);
+              unsigned int ready = 0;
+              uint64_t next = millis(), report = 0;
+              fprintf(stderr, "DIAGNOSTIC TX %s -> %s:%d, Ctrl+C stops\n", device, ip, PORT);
+              for (;;) {
+                  struct pollfd p = {fd, POLLIN, 0};
+                  if (poll(&p, 1, 5) < 0) { if (errno == EINTR) continue; fail("poll"); }
+                  if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                      fprintf(stderr, "USB disconnected: transmission stopped\n"); exit(2);
+                  }
+                  for (int j = 0; j < 1024; ++j) {
+                      struct js_event e;
+                      ssize_t n = read(fd, &e, sizeof(e));
+                      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                      if (n < 0 && errno == EINTR) continue;
+                      if (n != sizeof(e)) { fprintf(stderr, "Joystick read failed: stopped\n"); exit(2); }
+                      unsigned int type = e.type & ~JS_EVENT_INIT;
+                      if (type == JS_EVENT_AXIS && e.number < 8) {
+                          axes[e.number] = e.value < -32767 ? -32767 : e.value;
+                          ready |= 1u << e.number;
+                      } else if (type == JS_EVENT_BUTTON && e.number < 32) {
+                          if (e.value) buttons |= UINT32_C(1) << e.number;
+                          else buttons &= ~(UINT32_C(1) << e.number);
+                      }
+                  }
+                  uint64_t now = millis();
+                  if (ready == 255 && now >= next) {
+                      unsigned char packet[PACKET_SIZE];
+                      encode(packet, session, seq++, axes, buttons);
+                      if (sendto(s, packet, sizeof(packet), 0, (struct sockaddr *)&dst, sizeof(dst)) != sizeof(packet))
+                          fail("sendto (transmission stopped)");
+                      next = now + 20;
+                  }
+                  if (now >= report) {
+                      fprintf(stderr, "TX packets=%u axes-ready=0x%02x CH3=%d CH5=%d\n",
+                              seq, ready, channel(axes[2]), channel(axes[4]));
+                      report = now + 1000;
+                  }
+              }
+          }
+          static void receive(const char *ip) {
+              struct sockaddr_in expected = address(ip), local = address("0.0.0.0");
+              int s = socket(AF_INET, SOCK_DGRAM, 0);
+              if (s < 0) fail("socket");
+              if (bind(s, (struct sockaddr *)&local, sizeof(local))) fail("bind");
+              uint64_t last = 0, report = 0;
+              uint32_t session = 0, seq = 0;
+              int active = 0;
+              fprintf(stderr, "DIAGNOSTIC RX UDP %d, source %s; NO UART OUTPUT\n", PORT, ip);
+              for (;;) {
+                  struct pollfd p = {s, POLLIN, 0};
+                  if (poll(&p, 1, 50) < 0) { if (errno == EINTR) continue; fail("poll"); }
+                  uint64_t now = millis();
+                  if (active && now - last >= 300) {
+                      fprintf(stderr, "LINK LOST: no fresh packets for 300 ms\n"); active = 0;
+                  }
+                  if (!(p.revents & POLLIN)) continue;
+                  unsigned char packet[PACKET_SIZE + 1];
+                  struct sockaddr_in from;
+                  socklen_t len = sizeof(from);
+                  ssize_t n = recvfrom(s, packet, sizeof(packet), 0, (struct sockaddr *)&from, &len);
+                  if (n < 0) fail("recvfrom");
+                  int16_t axes[8];
+                  if (from.sin_addr.s_addr != expected.sin_addr.s_addr || !decode(packet, (size_t)n, axes)) continue;
+                  uint32_t new_session = get32(packet + 4), new_seq = get32(packet + 8);
+                  uint32_t delta = new_seq - seq;
+                  if (active && new_session == session && (delta == 0 || delta >= UINT32_C(0x80000000))) continue;
+                  if (!active) fprintf(stderr, "LINK ACTIVE\n");
+                  active = 1; session = new_session; seq = new_seq; last = now;
+                  if (now >= report) {
+                      printf("seq=%u", seq);
+                      for (int i = 0; i < 8; ++i) printf(" CH%d=%d", i + 1, channel(axes[i]));
+                      printf(" buttons=0x%08x\n", get32(packet + 28)); fflush(stdout);
+                      report = now + 250;
+                  }
+              }
+          }
+          static int test(void) {
+              unsigned char p[PACKET_SIZE];
+              int16_t a[8] = {-32767, 0, 32767, -1, 1, 100, -100, 1234}, b[8];
+              encode(p, 0x12345678, 0xffffffff, a, 0x80000001);
+              if (!decode(p, sizeof(p), b) || memcmp(a, b, sizeof(a)) ||
+                  get32(p + 4) != 0x12345678 || get32(p + 8) != 0xffffffff ||
+                  get32(p + 28) != 0x80000001 || channel(-32767) != 1000 ||
+                  channel(0) != 1500 || channel(32767) != 2000 || decode(p, 31, b)) return 1;
+              p[0] = 'X'; if (decode(p, sizeof(p), b)) return 1;
+              p[0] = 'P'; p[12] = 0x80; p[13] = 0; if (decode(p, sizeof(p), b)) return 1;
+              puts("PASS: wire encoding, endpoints, malformed packet rejection"); return 0;
+          }
+          int main(int argc, char **argv) {
+              if (argc == 2 && !strcmp(argv[1], "--self-test")) return test();
+              if (argc == 3 && !strcmp(argv[1], "rx")) { receive(argv[2]); return 0; }
+              if ((argc == 3 || argc == 4) && !strcmp(argv[1], "tx")) {
+                  transmit(argv[2], argc == 4 ? argv[3] : "/dev/input/js0"); return 0;
+              }
+              fprintf(stderr, "Usage: %s tx CAMERA_IP [/dev/input/js0] | rx NVR_IP | --self-test\nDiagnostic only. No CRSF or UART output.\n", argv[0]);
+              return 1;
+          }
+          SOURCE_EOF
+          cat > integration.py <<'TEST_EOF'
+          import socket, struct, subprocess, time
+          p = subprocess.Popen(['./out/check-native', 'rx', '127.0.0.1'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+          try:
+              time.sleep(0.2)
+              s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+              def send(seq, axes):
+                  s.sendto(struct.pack('!4sII8hI', b'PCK1', 99, seq, *axes, 0), ('127.0.0.1', 5610))
+              s.sendto(b'invalid', ('127.0.0.1', 5610))
+              send(10, [0, 0, -32767, 0, -32767, 0, 0, 0])
+              time.sleep(0.1)
+              send(9, [32767] * 8)  # Old sequence must not replace current data.
+              time.sleep(0.35)
+              send(11, [0, 0, 32767, 0, 32767, 0, 0, 0])
+              time.sleep(0.1)
+          finally:
+              p.terminate()
+              out, err = p.communicate(timeout=5)
+          print(out, err)
+          assert 'CH3=1000' in out and 'CH5=1000' in out
+          assert 'CH3=2000' in out and 'CH5=2000' in out
+          assert 'seq=9 ' not in out
+          assert 'LINK LOST' in err and err.count('LINK ACTIVE') == 2
+          print('PASS: UDP transfer, old sequence rejection, link loss and recovery')
+          TEST_EOF
+
+      - name: Build and test on runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcc -std=c11 -O2 -Wall -Wextra -Werror out/pocket-link-check.c -o out/check-native
+          ./out/check-native --self-test
+          python3 integration.py
+
+      - name: Build static ARM binary and test with emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          arm-linux-gnueabi-gcc -std=c11 -Os -static -march=armv5te -mfloat-abi=soft -Wall -Wextra -Werror out/pocket-link-check.c -o out/pocket-link-check
+          arm-linux-gnueabi-strip out/pocket-link-check
+          arm-linux-gnueabi-readelf -h out/pocket-link-check > out/elf-header.txt
+          arm-linux-gnueabi-readelf -l out/pocket-link-check > out/elf-segments.txt
+          if grep -q INTERP out/elf-segments.txt; then echo 'Unexpected dynamic loader'; exit 1; fi
+          qemu-arm out/pocket-link-check --self-test
+          cp out/pocket-link-check out/pocket-link-check-nvr
+          cp out/pocket-link-check out/pocket-link-check-camera
+          rm out/check-native
+          cd out
+          sha256sum pocket-link-check* > SHA256SUMS
+          printf '%s\n' 'Diagnostic only: USB -> UDP -> text. Does not open UART or control FC.' 'Camera: ./pocket-link-check-camera rx 192.168.1.12' 'NVR: ./pocket-link-check-nvr tx 192.168.1.10' 'UDP port 5610. Ctrl+C stops. No autostart or firmware changes.' > READ-FIRST.txt
+
+      - name: Upload diagnostic binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocket-ethernet-diagnostic
+          path: out/
+          retention-days: 14
