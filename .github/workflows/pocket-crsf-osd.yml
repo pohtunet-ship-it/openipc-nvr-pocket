@@ -1,0 +1,749 @@
+name: Pocket CRSF with stock OSD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Install compiler, emulator and independent MAVLink decoder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi qemu-user python3-venv
+          python3 -m venv qa-env
+          qa-env/bin/pip install pymavlink==2.4.49
+
+      - name: Write source and tests
+        shell: bash
+        run: |
+          mkdir -p out
+          cat > out/pocket-link-check.c <<'SOURCE_EOF'
+          /* Diagnostic only: USB joystick -> UDP -> text. Never opens a UART. */
+          #define _POSIX_C_SOURCE 200809L
+          #include <arpa/inet.h>
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <linux/joystick.h>
+          #include <poll.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/ioctl.h>
+          #include <sys/socket.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          #define PORT 5610
+          #define PACKET_SIZE 32
+          static uint64_t millis(void) {
+              struct timespec t;
+              if (clock_gettime(CLOCK_MONOTONIC, &t)) { perror("clock_gettime"); exit(1); }
+              return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+          }
+          static void fail(const char *s) { perror(s); exit(1); }
+          static void put32(unsigned char *p, uint32_t v) {
+              p[0] = (unsigned char)(v >> 24); p[1] = (unsigned char)(v >> 16);
+              p[2] = (unsigned char)(v >> 8); p[3] = (unsigned char)v;
+          }
+          static uint32_t get32(const unsigned char *p) {
+              return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                     ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+          }
+          static void encode(unsigned char *p, uint32_t session, uint32_t seq,
+                             const int16_t *axes, uint32_t buttons) {
+              memcpy(p, "PCK1", 4); put32(p + 4, session); put32(p + 8, seq);
+              for (int i = 0; i < 8; ++i) {
+                  uint16_t v = (uint16_t)axes[i];
+                  p[12 + i * 2] = (unsigned char)(v >> 8);
+                  p[13 + i * 2] = (unsigned char)v;
+              }
+              put32(p + 28, buttons);
+          }
+          static int decode(const unsigned char *p, size_t n, int16_t *axes) {
+              if (n != PACKET_SIZE || memcmp(p, "PCK1", 4)) return 0;
+              for (int i = 0; i < 8; ++i) {
+                  int v = ((int)p[12 + i * 2] << 8) | p[13 + i * 2];
+                  if (v >= 32768) v -= 65536;
+                  if (v < -32767) return 0;
+                  axes[i] = (int16_t)v;
+              }
+              return 1;
+          }
+          static int channel(int16_t v) {
+              return 1000 + (int)(((int64_t)v + 32767) * 1000 + 32767) / 65534;
+          }
+          static struct sockaddr_in address(const char *ip) {
+              struct sockaddr_in a;
+              memset(&a, 0, sizeof(a)); a.sin_family = AF_INET; a.sin_port = htons(PORT);
+              if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) {
+                  fprintf(stderr, "Invalid IPv4 address: %s\n", ip); exit(1);
+              }
+              return a;
+          }
+          static void transmit(const char *ip, const char *device) {
+              struct sockaddr_in dst = address(ip);
+              int fd = open(device, O_RDONLY | O_NONBLOCK);
+              if (fd < 0) fail(device);
+              unsigned char count = 0;
+              if (ioctl(fd, JSIOCGAXES, &count) < 0) fail("JSIOCGAXES");
+              if (count != 8) { fprintf(stderr, "Expected 8 Classic axes, got %u\n", count); exit(1); }
+              int s = socket(AF_INET, SOCK_DGRAM, 0);
+              if (s < 0) fail("socket");
+              int flags = fcntl(s, F_GETFL);
+              if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) fail("fcntl");
+              int16_t axes[8] = {0};
+              uint32_t buttons = 0, seq = 0, session = 0;
+              int random = open("/dev/urandom", O_RDONLY);
+              if (random < 0 || read(random, &session, sizeof(session)) != sizeof(session)) fail("random");
+              close(random);
+              unsigned int ready = 0;
+              uint64_t next = millis(), report = 0;
+              fprintf(stderr, "DIAGNOSTIC TX %s -> %s:%d, Ctrl+C stops\n", device, ip, PORT);
+              for (;;) {
+                  struct pollfd p = {fd, POLLIN, 0};
+                  if (poll(&p, 1, 5) < 0) { if (errno == EINTR) continue; fail("poll"); }
+                  if (p.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                      fprintf(stderr, "USB disconnected: transmission stopped\n"); exit(2);
+                  }
+                  for (int j = 0; j < 1024; ++j) {
+                      struct js_event e;
+                      ssize_t n = read(fd, &e, sizeof(e));
+                      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                      if (n < 0 && errno == EINTR) continue;
+                      if (n != sizeof(e)) { fprintf(stderr, "Joystick read failed: stopped\n"); exit(2); }
+                      unsigned int type = e.type & ~JS_EVENT_INIT;
+                      if (type == JS_EVENT_AXIS && e.number < 8) {
+                          axes[e.number] = e.value < -32767 ? -32767 : e.value;
+                          ready |= 1u << e.number;
+                      } else if (type == JS_EVENT_BUTTON && e.number < 32) {
+                          if (e.value) buttons |= UINT32_C(1) << e.number;
+                          else buttons &= ~(UINT32_C(1) << e.number);
+                      }
+                  }
+                  uint64_t now = millis();
+                  if (ready == 255 && now >= next) {
+                      unsigned char packet[PACKET_SIZE];
+                      encode(packet, session, seq++, axes, buttons);
+                      if (sendto(s, packet, sizeof(packet), 0, (struct sockaddr *)&dst, sizeof(dst)) != sizeof(packet))
+                          fail("sendto (transmission stopped)");
+                      next = now + 20;
+                  }
+                  if (now >= report) {
+                      fprintf(stderr, "TX packets=%u axes-ready=0x%02x CH3=%d CH5=%d\n",
+                              seq, ready, channel(axes[2]), channel(axes[4]));
+                      report = now + 1000;
+                  }
+              }
+          }
+          static void receive(const char *ip) {
+              struct sockaddr_in expected = address(ip), local = address("0.0.0.0");
+              int s = socket(AF_INET, SOCK_DGRAM, 0);
+              if (s < 0) fail("socket");
+              if (bind(s, (struct sockaddr *)&local, sizeof(local))) fail("bind");
+              uint64_t last = 0, report = 0;
+              uint32_t session = 0, seq = 0;
+              int active = 0;
+              fprintf(stderr, "DIAGNOSTIC RX UDP %d, source %s; NO UART OUTPUT\n", PORT, ip);
+              for (;;) {
+                  struct pollfd p = {s, POLLIN, 0};
+                  if (poll(&p, 1, 50) < 0) { if (errno == EINTR) continue; fail("poll"); }
+                  uint64_t now = millis();
+                  if (active && now - last >= 300) {
+                      fprintf(stderr, "LINK LOST: no fresh packets for 300 ms\n"); active = 0;
+                  }
+                  if (!(p.revents & POLLIN)) continue;
+                  unsigned char packet[PACKET_SIZE + 1];
+                  struct sockaddr_in from;
+                  socklen_t len = sizeof(from);
+                  ssize_t n = recvfrom(s, packet, sizeof(packet), 0, (struct sockaddr *)&from, &len);
+                  if (n < 0) fail("recvfrom");
+                  int16_t axes[8];
+                  if (from.sin_addr.s_addr != expected.sin_addr.s_addr || !decode(packet, (size_t)n, axes)) continue;
+                  uint32_t new_session = get32(packet + 4), new_seq = get32(packet + 8);
+                  uint32_t delta = new_seq - seq;
+                  if (active && new_session == session && (delta == 0 || delta >= UINT32_C(0x80000000))) continue;
+                  if (!active) fprintf(stderr, "LINK ACTIVE\n");
+                  active = 1; session = new_session; seq = new_seq; last = now;
+                  if (now >= report) {
+                      printf("seq=%u", seq);
+                      for (int i = 0; i < 8; ++i) printf(" CH%d=%d", i + 1, channel(axes[i]));
+                      printf(" buttons=0x%08x\n", get32(packet + 28)); fflush(stdout);
+                      report = now + 250;
+                  }
+              }
+          }
+          static int test(void) {
+              unsigned char p[PACKET_SIZE];
+              int16_t a[8] = {-32767, 0, 32767, -1, 1, 100, -100, 1234}, b[8];
+              encode(p, 0x12345678, 0xffffffff, a, 0x80000001);
+              if (!decode(p, sizeof(p), b) || memcmp(a, b, sizeof(a)) ||
+                  get32(p + 4) != 0x12345678 || get32(p + 8) != 0xffffffff ||
+                  get32(p + 28) != 0x80000001 || channel(-32767) != 1000 ||
+                  channel(0) != 1500 || channel(32767) != 2000 || decode(p, 31, b)) return 1;
+              p[0] = 'X'; if (decode(p, sizeof(p), b)) return 1;
+              p[0] = 'P'; p[12] = 0x80; p[13] = 0; if (decode(p, sizeof(p), b)) return 1;
+              puts("PASS: wire encoding, endpoints, malformed packet rejection"); return 0;
+          }
+          int main(int argc, char **argv) {
+              if (argc == 2 && !strcmp(argv[1], "--self-test")) return test();
+              if (argc == 3 && !strcmp(argv[1], "rx")) { receive(argv[2]); return 0; }
+              if ((argc == 3 || argc == 4) && !strcmp(argv[1], "tx")) {
+                  transmit(argv[2], argc == 4 ? argv[3] : "/dev/input/js0"); return 0;
+              }
+              fprintf(stderr, "Usage: %s tx CAMERA_IP [/dev/input/js0] | rx NVR_IP | --self-test\nDiagnostic only. No CRSF or UART output.\n", argv[0]);
+              return 1;
+          }
+          SOURCE_EOF
+          cat > out/pocket-crsf-osd.c <<'SOURCE_EOF'
+          /* Bench prototype: not flight-qualified. UART must be free of console output. */
+          #define _GNU_SOURCE
+          #define main diagnostic_main
+          #include "pocket-link-check.c"
+          #undef main
+          #include <asm/termbits.h>
+          #include <asm/ioctls.h>
+          #include <signal.h>
+
+          #define RC_TIMEOUT_MS 100
+          static volatile sig_atomic_t stopping;
+          static void stop_signal(int sig) { (void)sig; stopping = 1; }
+          static unsigned char crc8(const unsigned char *p, size_t n) {
+              unsigned char c = 0;
+              for (size_t i = 0; i < n; ++i) {
+                  c ^= p[i];
+                  for (int j = 0; j < 8; ++j)
+                      c = (unsigned char)((c << 1) ^ ((c & 0x80) ? 0xd5 : 0));
+              }
+              return c;
+          }
+          static uint16_t crsf_value(int16_t axis) {
+              return (uint16_t)(192 + (((int64_t)axis + 32767) * 1600 + 32767) / 65534);
+          }
+          static void rc_frame(unsigned char *out, const int16_t *axes, uint32_t buttons) {
+              memset(out, 0, 26); out[0] = 0xc8; out[1] = 24; out[2] = 0x16;
+              for (unsigned int ch = 0; ch < 16; ++ch) {
+                  uint16_t value = ch < 8 ? crsf_value(axes[ch]) :
+                                   ((buttons & (1u << (ch - 8))) ? 1792 : 192);
+                  for (unsigned int bit = 0; bit < 11; ++bit) {
+                      unsigned int pos = ch * 11 + bit;
+                      if (value & (1u << bit)) out[3 + pos / 8] |= (unsigned char)(1u << (pos % 8));
+                  }
+              }
+              out[25] = crc8(out + 2, 23);
+          }
+          static unsigned int be16(const unsigned char *p) { return (unsigned int)p[0] * 256 + p[1]; }
+          static int s16(const unsigned char *p) {
+              unsigned int n = be16(p); return n >= 32768 ? (int)n - 65536 : (int)n;
+          }
+          #include "pocket-osd.h"
+          static void telemetry_frame(const unsigned char *p, size_t n) {
+              osd_telemetry(p, n);
+              static uint64_t printed[256];
+              uint64_t now = millis();
+              if (printed[p[2]] && now - printed[p[2]] < 1000) return;
+              printed[p[2]] = now;
+              /* Only print fields present in valid telemetry. No fabricated OSD values. */
+              if (p[2] == 0x08 && n == 12) {
+                  printf("FC BAT=%.1fV CUR=%.1fA USED=%umAh REMAIN=%u%%\n",
+                         be16(p + 3) / 10.0, be16(p + 5) / 10.0,
+                         ((unsigned int)p[7] << 16) | ((unsigned int)p[8] << 8) | p[9], p[10]);
+              } else if (p[2] == 0x1e && n == 10) {
+                  printf("FC ATTITUDE pitch=%.1f roll=%.1f yaw=%.1f deg\n",
+                         s16(p + 3) * 0.00572957795, s16(p + 5) * 0.00572957795,
+                         s16(p + 7) * 0.00572957795);
+              } else if (p[2] == 0x21 && n > 4) {
+                  char mode[61]; size_t k = n - 4;
+                  for (size_t i = 0; i < k; ++i) mode[i] = p[i + 3] >= 32 && p[i + 3] < 127 ? (char)p[i + 3] : ' ';
+                  mode[k] = 0; printf("FC MODE=%s\n", mode);
+              } else if (p[2] == 0x02 && n == 19) {
+                  printf("FC GPS speed=%.1fkm/h altitude=%dm satellites=%u\n",
+                         be16(p + 11) / 10.0, (int)be16(p + 15) - 1000, p[17]);
+              }
+          }
+          static int serial_open(const char *device, struct termios2 *original) {
+              FILE *f = fopen("/proc/consoles", "r");
+              if (!f) fail("/proc/consoles");
+              const char *name = strrchr(device, '/'); name = name ? name + 1 : device;
+              char line[256], console[128];
+              while (fgets(line, sizeof(line), f)) {
+                  if (sscanf(line, "%127s", console) == 1 && !strcmp(name, console)) {
+                      fprintf(stderr, "Refusing active console\n"); exit(1);
+                  }
+              }
+              fclose(f);
+              int fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
+              if (fd < 0) fail("open UART");
+              if (ioctl(fd, TIOCEXCL)) fail("TIOCEXCL");
+              if (ioctl(fd, TCGETS2, original)) fail("TCGETS2");
+              struct termios2 t = *original;
+              t.c_iflag = 0; t.c_oflag = 0; t.c_lflag = 0;
+              t.c_cflag = BOTHER | CS8 | CLOCAL | CREAD;
+              t.c_ispeed = 420000; t.c_ospeed = 420000;
+              t.c_cc[VMIN] = 0; t.c_cc[VTIME] = 0;
+              if (ioctl(fd, TCSETS2, &t)) fail("TCSETS2");
+              if (ioctl(fd, TCGETS2, &t)) fail("TCGETS2 readback");
+              if (t.c_ispeed != 420000 || t.c_ospeed != 420000) {
+                  fprintf(stderr, "Unexpected UART speed\n"); exit(1);
+              }
+              if (ioctl(fd, TCFLSH, TCIOFLUSH)) fail("TCFLSH");
+              return fd;
+          }
+          static int udp_fresh(struct msghdr *msg) {
+              struct timespec now;
+              if (clock_gettime(CLOCK_REALTIME, &now)) return 0;
+              for (struct cmsghdr *c = CMSG_FIRSTHDR(msg); c; c = CMSG_NXTHDR(msg, c)) {
+                  if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS &&
+                      c->cmsg_len >= CMSG_LEN(sizeof(struct timespec))) {
+                      struct timespec stamp; memcpy(&stamp, CMSG_DATA(c), sizeof(stamp));
+                      int64_t age = ((int64_t)now.tv_sec - stamp.tv_sec) * 1000000000 + now.tv_nsec - stamp.tv_nsec;
+                      return age >= 0 && age <= RC_TIMEOUT_MS * 1000000LL;
+                  }
+              }
+              return 0;
+          }
+          static int bench(const char *ip, const char *device) {
+              struct sockaddr_in expected = address(ip), local = address("0.0.0.0");
+              int s = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+              if (s < 0) fail("socket");
+              int on = 1;
+              if (setsockopt(s, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on))) fail("SO_TIMESTAMPNS");
+              if (bind(s, (struct sockaddr *)&local, sizeof(local))) fail("bind UDP 5610");
+              struct termios2 original;
+              int fd = serial_open(device, &original);
+              osd_open(ip);
+              signal(SIGINT, stop_signal); signal(SIGTERM, stop_signal);
+              setvbuf(stdout, NULL, _IOLBF, 0);
+              int unlocked = 0, have = 0, live = 0, result = 0;
+              uint32_t session = 0, seq = 0, sent = 0, telem = 0;
+              uint64_t last = 0, report = 0, last_telem = 0;
+              int16_t axes[8] = {0}; uint32_t buttons = 0;
+              unsigned char buf[64]; size_t used = 0;
+              puts("BENCH ONLY: 420000 8N1. Waiting for CH5 DISARM and CH3 low. Ctrl+C stops.");
+              while (!stopping) {
+                  struct pollfd p[2] = {{s, POLLIN, 0}, {fd, POLLIN, 0}};
+                  int r = poll(p, 2, 10);
+                  if (r < 0 && errno == EINTR) continue;
+                  if (r < 0 || (p[1].revents & (POLLERR | POLLHUP | POLLNVAL))) { result = 1; break; }
+                  uint64_t now = millis();
+                  if (live && now - last >= RC_TIMEOUT_MS) {
+                      live = 0; unlocked = 0;
+                      ioctl(fd, TCFLSH, TCOFLUSH);
+                      puts("LINK LOST: RC output stopped; DISARM + low throttle required to resume.");
+                  }
+                  int fresh = 0;
+                  for (int count = 0; count < 256; ++count) {
+                      unsigned char packet[PACKET_SIZE + 1];
+                      union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(struct timespec))]; } control;
+                      struct sockaddr_in from;
+                      struct iovec iov = {packet, sizeof(packet)};
+                      struct msghdr msg; memset(&msg, 0, sizeof(msg));
+                      msg.msg_name = &from; msg.msg_namelen = sizeof(from);
+                      msg.msg_iov = &iov; msg.msg_iovlen = 1;
+                      msg.msg_control = control.bytes; msg.msg_controllen = sizeof(control.bytes);
+                      ssize_t n = recvmsg(s, &msg, 0);
+                      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                      if (n < 0) { if (errno == EINTR) continue; result = 1; stopping = 1; break; }
+                      int16_t candidate[8];
+                      if ((msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || from.sin_addr.s_addr != expected.sin_addr.s_addr ||
+                          !decode(packet, (size_t)n, candidate) || !udp_fresh(&msg)) continue;
+                      uint32_t ns = get32(packet + 4), nq = get32(packet + 8), delta = nq - seq;
+                      if (have && ns == session && (!delta || delta >= UINT32_C(0x80000000))) continue;
+                      if (have && ns != session) unlocked = 0;
+                      have = 1; session = ns; seq = nq;
+                      memcpy(axes, candidate, sizeof(axes)); buttons = get32(packet + 28);
+                      fresh = 1;
+                  }
+                  if (fresh && !stopping) {
+                      last = millis(); live = 1;
+                      if (!unlocked && axes[4] <= -30000 && axes[2] <= -30000) {
+                          unlocked = 1; puts("RC ENABLED: initial DISARM + low throttle observed.");
+                      }
+                      if (unlocked) {
+                          int queued = 0;
+                          if (ioctl(fd, TIOCOUTQ, &queued)) { result = 1; break; }
+                          if (queued) { puts("UART backlog: RC stopped"); result = 1; break; }
+                          unsigned char frame[26]; rc_frame(frame, axes, buttons);
+                          if (write(fd, frame, sizeof(frame)) != (ssize_t)sizeof(frame)) { perror("UART write"); result = 1; break; }
+                          ++sent;
+                          osd_rc(axes);
+                      }
+                  }
+                  /* Bounded incremental parser: CRC-valid CRSF telemetry frames only. */
+                  for (int count = 0; count < 512; ++count) {
+                      unsigned char byte; ssize_t n = read(fd, &byte, 1);
+                      if (n < 0 && errno == EINTR) continue;
+                      if (n <= 0) break;
+                      if (used == sizeof(buf)) { memmove(buf, buf + 1, --used); }
+                      buf[used++] = byte;
+                      while (used >= 2) {
+                          size_t total = (size_t)buf[1] + 2;
+                          if (total < 4 || total > 64) { memmove(buf, buf + 1, --used); continue; }
+                          if (used < total) break;
+                          if (crc8(buf + 2, total - 3) != buf[total - 1]) { memmove(buf, buf + 1, --used); continue; }
+                          ++telem; last_telem = millis(); telemetry_frame(buf, total);
+                          used -= total; memmove(buf, buf + total, used);
+                      }
+                  }
+                  now = millis();
+                  if (last_telem && now - last_telem >= 2000) { puts("TELEMETRY STALE: no new valid frame for 2 seconds"); last_telem = 0; }
+                  if (now >= report) {
+                      printf("RC sent=%u telemetry=%u gate=%s CH3=%d CH5=%d\n", sent, telem,
+                             unlocked ? "OPEN" : "WAIT_DISARM_LOW", channel(axes[2]), channel(axes[4]));
+                      printf("OSD sent=%lu dropped=%lu\n", osd_sent, osd_dropped);
+                      report = now + 1000;
+                  }
+              }
+              ioctl(fd, TCFLSH, TCOFLUSH);
+              if (ioctl(fd, TCSETS2, &original)) { perror("restore UART"); result = 1; }
+              ioctl(fd, TIOCNXCL); close(fd); close(s);
+              if (osd_socket >= 0) close(osd_socket);
+              puts("STOPPED: no further RC frames"); return result;
+          }
+          static int crsf_test(void) {
+              if (test()) return 1;
+              if (crc8((const unsigned char *)"123456789", 9) != 0xbc) return 1;
+              int16_t axes[8] = {-32767, 0, 32767, 0, -32767, 32767, 0, -32767};
+              unsigned char f[26]; rc_frame(f, axes, 0x81);
+              if (f[0] != 0xc8 || f[1] != 24 || f[2] != 0x16 || crc8(f + 2, 23) != f[25]) return 1;
+              const unsigned int values[16] = {192, 992, 1792, 992, 192, 1792, 992, 192, 1792, 192, 192, 192, 192, 192, 192, 1792};
+              for (unsigned int ch = 0; ch < 16; ++ch) {
+                  unsigned int value = 0;
+                  for (unsigned int bit = 0; bit < 11; ++bit) {
+                      unsigned int pos = ch * 11 + bit;
+                      value |= ((f[3 + pos / 8] >> (pos % 8)) & 1u) << bit;
+                  }
+                  if (value != values[ch]) return 1;
+              }
+              puts("PASS: CRSF CRC-8/DVB-S2 and all 16 packed channel values"); return 0;
+          }
+          int main(int argc, char **argv) {
+              if (argc == 2 && !strcmp(argv[1], "--self-test")) return crsf_test();
+              if (argc == 4 && !strcmp(argv[1], "camera")) return bench(argv[2], argv[3]);
+              if ((argc == 3 || argc == 4) && !strcmp(argv[1], "tx")) {
+                  transmit(argv[2], argc == 4 ? argv[3] : "/dev/input/js0"); return 0;
+              }
+              fprintf(stderr, "Usage: %s --self-test | tx CAMERA_IP [JS_DEVICE] | camera NVR_IP UART\nBench prototype with legacy OSD forwarding. No autostart yet.\n", argv[0]);
+              return 1;
+          }
+          SOURCE_EOF
+          cat > out/pocket-osd.h <<'SOURCE_EOF'
+          /* Small MAVLink v1 adapter for the existing OpenIPC vdec simple OSD.
+           * Not an FC control port: RC_CHANNELS_RAW fields are the vdec display ABI.
+           * CH4 in that message is throttle, CH8 MUST stay low (resolution script).
+           * Real CRSF channel ordering is unchanged.
+           */
+          static int osd_socket = -1;
+          static struct sockaddr_in osd_address;
+          static unsigned char osd_seq;
+          static uint64_t osd_battery_at, osd_attitude_at, osd_rc_at, osd_mode_at;
+          static int osd_armed;
+          static unsigned long osd_sent, osd_dropped;
+          static void le16(unsigned char *p, uint16_t v) { p[0] = (unsigned char)v; p[1] = (unsigned char)(v >> 8); }
+          static void le32(unsigned char *p, uint32_t v) {
+              le16(p, (uint16_t)v); le16(p + 2, (uint16_t)(v >> 16));
+          }
+          static void lefloat(unsigned char *p, float v) {
+              uint32_t bits; memcpy(&bits, &v, sizeof(bits)); le32(p, bits);
+          }
+          static uint16_t mav_crc_byte(uint16_t crc, unsigned char byte) {
+              unsigned char t = byte ^ (unsigned char)crc;
+              t ^= (unsigned char)(t << 4);
+              return (uint16_t)((crc >> 8) ^ ((uint16_t)t << 8) ^ ((uint16_t)t << 3) ^ (t >> 4));
+          }
+          static void osd_message(unsigned char id, unsigned char extra, const unsigned char *payload, unsigned char len) {
+              if (osd_socket < 0) return;
+              unsigned char packet[64];
+              if (len > sizeof(packet) - 8) return;
+              packet[0] = 0xfe; packet[1] = len; packet[2] = osd_seq++;
+              packet[3] = 1; packet[4] = 191; packet[5] = id;
+              memcpy(packet + 6, payload, len);
+              uint16_t crc = 0xffff;
+              for (unsigned int i = 1; i < (unsigned int)len + 6; ++i) crc = mav_crc_byte(crc, packet[i]);
+              crc = mav_crc_byte(crc, extra); le16(packet + 6 + len, crc);
+              ssize_t n = sendto(osd_socket, packet, len + 8, MSG_DONTWAIT,
+                                 (struct sockaddr *)&osd_address, sizeof(osd_address));
+              if (n == len + 8) ++osd_sent;
+              else ++osd_dropped; /* OSD failure must never block RC. */
+          }
+          static void osd_open(const char *ip) {
+              osd_address = address(ip); osd_address.sin_port = htons(14750);
+              osd_socket = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+              if (osd_socket < 0) perror("OSD disabled: socket");
+              else printf("OSD MAVLink -> %s:14750 (BAT CUR CONS THR horizon)\n", ip);
+          }
+          static void osd_telemetry(const unsigned char *p, size_t n) {
+              uint64_t now = millis();
+              if (p[2] == 0x21 && n > 4) {
+                  /* Betaflight 4.3.2 appends '*' to flight-mode text when disarmed. */
+                  size_t length = n - 4;
+                  const unsigned char *end = memchr(p + 3, 0, length);
+                  if (end && end != p + 3) {
+                      osd_armed = memchr(p + 3, '*', (size_t)(end - (p + 3))) == NULL;
+                      osd_mode_at = now;
+                  }
+              } else if (p[2] == 0x08 && n == 12 && (!osd_battery_at || now - osd_battery_at >= 200)) {
+                  uint32_t voltage = be16(p + 3) * 100u; /* decivolt -> mV */
+                  uint32_t current = be16(p + 5) * 10u;  /* deciamp -> centiamp */
+                  uint32_t consumed = ((uint32_t)p[7] << 16) | ((uint32_t)p[8] << 8) | p[9];
+                  uint16_t mv = voltage < 65535 ? (uint16_t)voltage : 65535;
+                  uint16_t ca = current <= 32767 ? (uint16_t)current : 65535;
+                  unsigned char remaining = p[10] <= 100 ? p[10] : 255;
+                  unsigned char sys[31] = {0};
+                  le16(sys + 14, mv); le16(sys + 16, ca); sys[30] = remaining;
+                  osd_message(1, 124, sys, sizeof(sys));
+                  unsigned char bat[36] = {0};
+                  le32(bat, consumed); le32(bat + 4, UINT32_MAX); le16(bat + 8, 32767);
+                  for (int i = 0; i < 10; ++i) le16(bat + 10 + i * 2, i == 0 ? mv : 65535);
+                  le16(bat + 30, ca); bat[35] = remaining;
+                  osd_message(147, 154, bat, sizeof(bat)); osd_battery_at = now;
+              } else if (p[2] == 0x1e && n == 10 && (!osd_attitude_at || now - osd_attitude_at >= 100)) {
+                  unsigned char att[28] = {0}; le32(att, (uint32_t)now);
+                  /* CRSF order: pitch, roll, yaw. MAVLink order: roll, pitch, yaw. */
+                  lefloat(att + 4, s16(p + 5) / 10000.0f);
+                  lefloat(att + 8, s16(p + 3) / 10000.0f);
+                  lefloat(att + 12, s16(p + 7) / 10000.0f);
+                  osd_message(30, 39, att, sizeof(att)); osd_attitude_at = now;
+              }
+          }
+          static void osd_rc(const int16_t *axes) {
+              uint64_t now = millis();
+              if (osd_rc_at && now - osd_rc_at < 100) return;
+              unsigned char rc[22] = {0}; le32(rc, (uint32_t)now);
+              le16(rc + 4, (uint16_t)channel(axes[0]));
+              le16(rc + 6, (uint16_t)channel(axes[1]));
+              le16(rc + 8, (uint16_t)channel(axes[2]));
+              le16(rc + 10, (uint16_t)channel(axes[2])); /* vdec THR reads chan4 */
+              le16(rc + 12, osd_mode_at && now - osd_mode_at < 2000 ? (osd_armed ? 2000 : 1000) : 0);
+              le16(rc + 14, 1000); le16(rc + 16, 1000);
+              le16(rc + 18, 1000); /* Never trigger vdec's resolution.sh via CH8. */
+              rc[21] = 0; /* No RF RSSI exists on this wired bridge; leave legacy display at zero. */
+              osd_message(35, 244, rc, sizeof(rc)); osd_rc_at = now;
+          }
+          SOURCE_EOF
+          cat > test-crsf.py <<'SOURCE_EOF'
+          import os
+          import pty
+          import select
+          import signal
+          import socket
+          import struct
+          import subprocess
+          import time
+
+          master, slave = pty.openpty()
+          p = subprocess.Popen(['./out/bench-native', 'camera', '127.0.0.1', os.ttyname(slave)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          seq = 0
+
+          def packet(arm=-32767, throttle=-32767, number=None):
+              global seq
+              seq += 1
+              axes = [0, 0, throttle, 0, arm, -32767, -32767, -32767]
+              data = struct.pack('!4sII8hI', b'PCK1', 42, seq if number is None else number, *axes, 1)
+              s.sendto(data, ('127.0.0.1', 5610))
+
+          def collect(duration):
+              end = time.monotonic() + duration
+              data = b''
+              while time.monotonic() < end:
+                  if select.select([master], [], [], max(0, end - time.monotonic()))[0]:
+                      data += os.read(master, 4096)
+              return data
+
+          def crc8(data):
+              crc = 0
+              for b in data:
+                  crc ^= b
+                  for _ in range(8):
+                      crc = ((crc << 1) ^ (0xD5 if crc & 0x80 else 0)) & 255
+              return crc
+
+          def valid(data, arm):
+              assert len(data) == 26, data.hex()
+              assert data[:3] == bytes([0xC8, 24, 0x16])
+              assert crc8(data[2:-1]) == data[-1]
+              bits = int.from_bytes(data[3:25], 'little')
+              channels = [(bits >> (11 * i)) & 2047 for i in range(16)]
+              assert channels[0] == 992 and channels[2] == 192
+              assert channels[4] == arm and channels[8] == 1792 and channels[9] == 192
+
+          try:
+              time.sleep(0.25)
+              assert p.poll() is None
+              packet(32767)
+              assert collect(0.04) == b'', 'startup with ARM must not transmit'
+              packet(-32767, 32767)
+              assert collect(0.04) == b'', 'startup with high throttle must not transmit'
+              packet()
+              valid(collect(0.04), 192)
+              packet(32767)
+              valid(collect(0.04), 1792)
+              previous = seq
+              packet(32767, number=previous)
+              assert collect(0.025) == b'', 'duplicate accepted'
+              packet(32767, number=previous - 1)
+              assert collect(0.025) == b'', 'out-of-order accepted'
+              assert collect(0.2) == b'', 'no input must mean no repeated frames'
+              packet(32767)
+              assert collect(0.04) == b'', 'ARM after outage must not resume output'
+              packet()
+              valid(collect(0.04), 192)
+              os.kill(p.pid, signal.SIGSTOP)
+              packet(32767)
+              time.sleep(0.2)
+              os.kill(p.pid, signal.SIGCONT)
+              assert collect(0.06) == b'', 'old queued datagram accepted'
+              packet()
+              valid(collect(0.04), 192)
+              body = bytes([0x08]) + struct.pack('!HH', 168, 23) + bytes([0, 0, 42, 80])
+              telemetry = bytes([0xEA, len(body) + 1]) + body + bytes([crc8(body)])
+              os.write(master, telemetry)
+              time.sleep(0.1)
+          finally:
+              if p.poll() is None:
+                  os.kill(p.pid, signal.SIGCONT)
+                  p.terminate()
+              out, err = p.communicate(timeout=5)
+              print(out, err)
+              os.close(master)
+              os.close(slave)
+              s.close()
+          assert p.returncode == 0
+          assert 'FC BAT=16.8V CUR=2.3A USED=42mAh REMAIN=80%' in out
+          assert 'LINK LOST' in out and 'STOPPED' in out
+          print('PASS: CRSF wire bytes, startup interlock, duplicates, timeout, re-arm gate, stale queued packets, telemetry')
+          SOURCE_EOF
+          cat > test-osd.py <<'SOURCE_EOF'
+          import math
+          import os
+          import pty
+          import select
+          import socket
+          import struct
+          import subprocess
+          import time
+          from pymavlink.dialects.v10 import common as mav
+
+          listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          listener.bind(('127.0.0.1', 14750))
+          listener.setblocking(False)
+          sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          master, slave = pty.openpty()
+          p = subprocess.Popen(['./out/bench-native', 'camera', '127.0.0.1', os.ttyname(slave)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+          seq = 0
+          messages = []
+          decoder = mav.MAVLink(None)
+
+          def collect():
+              while True:
+                  try:
+                      data = listener.recv(2048)
+                  except BlockingIOError:
+                      break
+                  message = decoder.parse_char(data)
+                  assert message is not None and message.get_type() != 'BAD_DATA'
+                  messages.append(message)
+              while select.select([master], [], [], 0)[0]:
+                  os.read(master, 4096)  # Drain CRSF RC output; previous regression test validates it.
+
+          def tick(throttle, duration=0.25):
+              global seq
+              end = time.monotonic() + duration
+              while time.monotonic() < end:
+                  seq += 1
+                  # CH8 deliberately high: it must NOT reach vdec's resolution-switch field.
+                  data = struct.pack('!4sII8hI', b'PCK1', 71, seq, 0, 0, throttle, 0, -32767, 0, 0, 32767, 0)
+                  sender.sendto(data, ('127.0.0.1', 5610))
+                  time.sleep(0.02)
+                  collect()
+
+          def crc8(data):
+              c = 0
+              for b in data:
+                  c ^= b
+                  for _ in range(8): c = ((c << 1) ^ (0xd5 if c & 128 else 0)) & 255
+              return c
+
+          def telemetry(kind, payload, corrupt=False):
+              body = bytes([kind]) + payload
+              packet = bytes([0xea, len(body) + 1]) + body + bytes([crc8(body) ^ (1 if corrupt else 0)])
+              os.write(master, packet)
+
+          try:
+              time.sleep(0.2)
+              assert p.poll() is None
+              tick(-32767)
+              telemetry(0x08, struct.pack('!HH', 164, 11) + bytes([0, 0, 7, 80]))
+              telemetry(0x1e, struct.pack('!hhh', 1000, -2000, 10000))
+              telemetry(0x21, b'AIR*\0')
+              tick(-32767)
+              tick(0)
+              tick(32767)
+              telemetry(0x21, b'AIR\0')
+              telemetry(0x08, struct.pack('!HH', 234, 999) + bytes([0, 0, 9, 90]), corrupt=True)
+              tick(-32767)
+              before = len(messages)
+              time.sleep(0.25)
+              collect()
+              # Stop means no fabricated periodic battery or attitude updates.
+              tail = messages[before:]
+              assert not any(m.get_type() in ('SYS_STATUS', 'BATTERY_STATUS', 'ATTITUDE') for m in tail)
+          finally:
+              p.terminate()
+              out, err = p.communicate(timeout=5)
+              print(out, err)
+              os.close(master); os.close(slave); listener.close(); sender.close()
+
+          assert p.returncode == 0
+          types = {m.get_type() for m in messages}
+          assert types == {'SYS_STATUS', 'BATTERY_STATUS', 'ATTITUDE', 'RC_CHANNELS_RAW'}, types
+          sys = [m for m in messages if m.get_type() == 'SYS_STATUS']
+          assert sys and all(m.voltage_battery == 16400 and m.current_battery == 110 and m.battery_remaining == 80 for m in sys)
+          bat = [m for m in messages if m.get_type() == 'BATTERY_STATUS']
+          assert bat and all(m.current_consumed == 7 and m.voltages[0] == 16400 and m.current_battery == 110 for m in bat)
+          att = [m for m in messages if m.get_type() == 'ATTITUDE']
+          assert att and all(math.isclose(m.roll, -0.2, abs_tol=1e-6) and math.isclose(m.pitch, 0.1, abs_tol=1e-6) and math.isclose(m.yaw, 1, abs_tol=1e-6) for m in att)
+          rc = [m for m in messages if m.get_type() == 'RC_CHANNELS_RAW']
+          assert {1000, 1500, 2000}.issubset({m.chan4_raw for m in rc})
+          assert {1000, 2000}.issubset({m.chan5_raw for m in rc})
+          assert all(m.chan8_raw == 1000 for m in rc)
+          assert all(m.rssi == 0 for m in rc)
+          print('PASS: independent pymavlink decoding, volts/amps/mAh, attitude ordering, throttle 0/50/100%, FC armed state, corrupt CRC rejection, resolution trigger disabled')
+          SOURCE_EOF
+
+      - name: Check CRSF regression and stock OSD packets
+        run: |
+          set -eu
+          gcc -std=c11 -O2 -Wall -Wextra -Werror out/pocket-crsf-osd.c -o out/bench-native
+          ./out/bench-native --self-test
+          qa-env/bin/python test-crsf.py
+          qa-env/bin/python test-osd.py
+
+      - name: Build static ARM executable
+        run: |
+          set -eu
+          arm-linux-gnueabi-gcc -std=c11 -Os -static -march=armv5te -mfloat-abi=soft -Wall -Wextra -Werror out/pocket-crsf-osd.c -o out/pocket-crsf-osd
+          arm-linux-gnueabi-strip out/pocket-crsf-osd
+          arm-linux-gnueabi-readelf -h out/pocket-crsf-osd > out/elf-header.txt
+          arm-linux-gnueabi-readelf -l out/pocket-crsf-osd > out/elf-segments.txt
+          if grep -q INTERP out/elf-segments.txt; then exit 1; fi
+          qemu-arm out/pocket-crsf-osd --self-test
+          rm out/bench-native
+          cd out
+          sha256sum pocket-crsf-osd pocket-crsf-osd.c pocket-link-check.c pocket-osd.h > SHA256SUMS
+          printf '%s\n' 'BENCH PROTOTYPE. FC failsafe and restart behavior still require hardware testing.' 'NVR vdec firmware is unchanged.' 'Camera: ./pocket-crsf-osd camera 192.168.1.12 /dev/ttyAMA0' 'NVR: existing ./pocket-crsf-bench tx 192.168.1.10 OR ./pocket-crsf-osd tx 192.168.1.10' 'RC: UDP 5610. OSD: MAVLink v1 UDP 14750 to the NVR IP.' 'Fields: BAT CUR CONS from FC; THR from commanded CH3; attitude from FC.' 'The OSD channel-4 mapping does NOT change CRSF channel order.' 'OSD channel 8 stays 1000 to prevent automatic resolution script activation.' 'OSD timer/arming field follows FC mode text when fresh; unavailable state is zero.' 'Stock vdec may retain stale readings; no replacement or stale-data changes were made.' 'Missing GPS, radio RSSI, altitude and temperature are not invented.' 'Ctrl+C stops RC output. Program has no autostart; files in /tmp disappear on reboot.' > READ-FIRST.txt
+
+      - name: Upload stock OSD bridge
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocket-crsf-osd
+          path: out/
+          retention-days: 14
